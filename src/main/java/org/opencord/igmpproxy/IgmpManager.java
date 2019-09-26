@@ -20,6 +20,7 @@ import com.google.common.collect.Sets;
 import org.apache.felix.scr.annotations.Activate;
 import org.apache.felix.scr.annotations.Component;
 import org.apache.felix.scr.annotations.Deactivate;
+import org.apache.felix.scr.annotations.Property;
 import org.apache.felix.scr.annotations.Reference;
 import org.apache.felix.scr.annotations.ReferenceCardinality;
 import org.onlab.packet.EthType;
@@ -70,6 +71,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -81,6 +83,7 @@ import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -143,6 +146,15 @@ public class IgmpManager {
     protected NetworkConfigRegistry networkConfig;
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected MulticastRouteService multicastService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected IgmpStatisticsService igmpStatisticsManager;
+
+    private static final int DEFAULT_REPEAT_DELAY = 20;
+    @Property(name = "statisticsGenerationEvent", intValue = DEFAULT_REPEAT_DELAY,
+            label = "statisticsGenerationEvent")
+    private int statisticsGenerationEvent = DEFAULT_REPEAT_DELAY;
+
     private IgmpPacketProcessor processor = new IgmpPacketProcessor();
     private Logger log = LoggerFactory.getLogger(getClass());
     private ApplicationId coreAppId;
@@ -152,6 +164,12 @@ public class IgmpManager {
             new InternalNetworkConfigListener();
     private DeviceListener deviceListener = new InternalDeviceListener();
     private ConfigFactory<DeviceId, AccessDeviceConfig> configFactory = null;
+
+    protected IgmpStatisticsEventPublisher igmpStatisticsPublisher;
+    private List<Byte> validMembershipModes = Arrays.asList((byte) 1, (byte) 2, (byte) 3, (byte) 4, (byte) 5, (byte) 6);
+    ScheduledFuture<?> scheduledFuture;
+
+    ScheduledExecutorService executorForIgmp;
     private ConfigFactory<ApplicationId, IgmpproxyConfig> igmpproxyConfigFactory =
             new ConfigFactory<ApplicationId, IgmpproxyConfig>(
                     SubjectFactories.APP_SUBJECT_FACTORY, IGMPPROXY_CONFIG_CLASS, "igmpproxy") {
@@ -226,7 +244,10 @@ public class IgmpManager {
         }
         deviceService.addListener(deviceListener);
         scheduledExecutorService.scheduleAtFixedRate(new IgmpProxyTimerTask(), 0, 1000, TimeUnit.MILLISECONDS);
-
+        executorForIgmp = Executors.newScheduledThreadPool(1);
+        igmpStatisticsPublisher = new IgmpStatisticsEventPublisher();
+        scheduledFuture = executorForIgmp.scheduleAtFixedRate(igmpStatisticsPublisher,
+                0, statisticsGenerationEvent, TimeUnit.SECONDS);
         log.info("Started");
     }
 
@@ -244,7 +265,8 @@ public class IgmpManager {
         deviceService.removeListener(deviceListener);
         packetService.removeProcessor(processor);
         flowRuleService.removeFlowRulesById(appId);
-
+        scheduledFuture.cancel(true);
+        executorForIgmp.shutdown();
         log.info("Stopped");
     }
 
@@ -281,11 +303,13 @@ public class IgmpManager {
         if (gAddr != null && !gAddr.isZero()) {
             for (DeviceId devId : oltData.keySet()) {
                 StateMachine.specialQuery(devId, gAddr, maxResp);
+                igmpStatisticsManager.getIgmpStats().incrementGroupSpecificQueriesTxCounter();
             }
         } else {
             //Don't know which group is targeted by the query
             //So query all the members(in all the OLTs) and proxy their reports
             StateMachine.generalQuery(maxResp);
+            igmpStatisticsManager.getIgmpStats().incrementGeneralQueriesTxCounter();
         }
     }
 
@@ -319,7 +343,9 @@ public class IgmpManager {
         boolean join = false;
 
         ArrayList<Ip4Address> sourceList = new ArrayList<>();
-
+        if (!validMembershipModes.contains(recordType)) {
+        	igmpStatisticsManager.getIgmpStats().incrementReportsRxWithWrongModeCounter();
+        }
         if (igmpGroup.getSources().size() > 0) {
             igmpGroup.getSources().forEach(source -> sourceList.add(source.getIp4Address()));
             if (recordType == IGMPMembership.CHANGE_TO_EXCLUDE_MODE ||
@@ -396,6 +422,7 @@ public class IgmpManager {
                 return;
             } else {
                 groupMember.setLeave(true);
+
                 if (fastLeave) {
                     leaveAction(groupMember);
                 } else {
@@ -424,6 +451,9 @@ public class IgmpManager {
         }
         IgmpSender.getInstance().sendIgmpPacket(ethpkt, groupMember.getDeviceId(), groupMember.getPortNumber());
     }
+    
+    private void isValidIgmpPacket(IGMP.IGMPv2 igmp) {
+    }
 
     /**
      * @return connect point of the source if configured; and empty Optional otherwise.
@@ -441,6 +471,7 @@ public class IgmpManager {
         public void process(PacketContext context) {
 
             try {
+
                 InboundPacket pkt = context.inPacket();
                 Ethernet ethPkt = pkt.parsed();
                 if (ethPkt == null) {
@@ -452,7 +483,8 @@ public class IgmpManager {
                 }
 
                 IPv4 ipv4Pkt = (IPv4) ethPkt.getPayload();
-
+                byte ipv4HeaderLength = ipv4Pkt.getHeaderLength();
+                short ipChecksum = ipv4Pkt.getChecksum();
                 if (ipv4Pkt.getProtocol() != IPv4.PROTOCOL_IGMP) {
                     return;
                 }
@@ -491,8 +523,11 @@ public class IgmpManager {
                         log.debug("IGMP version 1  message types are not currently supported.");
                         break;
                     case IGMP.TYPE_IGMPV3_MEMBERSHIP_REPORT:
+                    	igmpStatisticsManager.getIgmpStats().incrementV3MembershipReportReqRxCounter();
                     case IGMP.TYPE_IGMPV2_MEMBERSHIP_REPORT:
+                    	igmpStatisticsManager.getIgmpStats().incrementV2MembershipReportReqRxCounter();
                     case IGMP.TYPE_IGMPV2_LEAVE_GROUP:
+                    	igmpStatisticsManager.getIgmpStats().incrementIgmpLeaveReqRxCounter();
                         //Discard join/leave from OLT’s uplink port’s
                         if (pkt.receivedFrom().port().equals(getDeviceUplink(deviceId)) ||
                                 isConnectPoint(deviceId, pkt.receivedFrom().port())) {
@@ -518,6 +553,10 @@ public class IgmpManager {
                         break;
 
                     default:
+                        if(igmp.getIgmpType() != IGMP.TYPE_IGMPV3_MEMBERSHIP_REPORT || 
+                        		igmp.getIgmpType() != IGMP.TYPE_IGMPV2_MEMBERSHIP_REPORT) {
+                        	igmpStatisticsManager.getIgmpStats().incrementUnknownIgmpTypePacketsRxCounter();
+                        }
                         log.info("wrong IGMP v3 type:" + igmp.getIgmpType());
                         break;
                 }
@@ -866,5 +905,15 @@ public class IgmpManager {
             return;
         }
         processFilterObjective(connectPoint.deviceId(), connectPoint.port(), true);
+    }
+
+    private class IgmpStatisticsEventPublisher implements Runnable {
+        public void run() {
+            log.info("Notifying IgmpStatisticsEvent");
+            igmpStatisticsManager.getStatsDelegate().
+                 notify(new IgmpStatisticsEvent(IgmpStatisticsEvent.Type.STATS_UPDATE,
+                                                                    igmpStatisticsManager.getIgmpStats()));
+            log.info("---------notified-----");
+        }
     }
 }
